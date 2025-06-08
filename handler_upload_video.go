@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,6 +44,27 @@ func getVideoAspectRatio(filepath string) (string, error) {
 	}
 
 	return "other", nil
+}
+
+func processVideoForFastStart(filepath string) (string, error) {
+	output := filepath + ".processing"
+	command := exec.Command("ffmpeg", "-i", filepath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", output)
+
+	err := command.Run()
+
+	if err != nil {
+		return "", err
+	}
+
+	fileInfo, err := os.Stat(output)
+	if err != nil {
+		return "", fmt.Errorf("could not stat processed file: %v", err)
+	}
+	if fileInfo.Size() == 0 {
+		return "", fmt.Errorf("processed file is empty")
+	}
+
+	return output, nil
 }
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
@@ -114,9 +133,6 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
-
 	_, err = io.Copy(tmpFile, uploadedVideo)
 
 	if err != nil {
@@ -132,6 +148,8 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Error when fetching video ratio", err)
 		return
 	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
 
 	if ratio == "16:9" {
 		ratio = "landscape"
@@ -139,18 +157,30 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		ratio = "portrait"
 	}
 
-	randName := make([]byte, 32)
-	rand.Read(randName)
+	processed, err := processVideoForFastStart(tmpFile.Name())
 
-	rawUrlEncoding := base64.RawURLEncoding.EncodeToString(randName)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error when converting video for streaming", err)
+		return
+	}
+	defer os.Remove(processed)
 
-	key := fmt.Sprintf("%v/%v.mp4", ratio, rawUrlEncoding)
+	processedFile, err := os.Open(processed)
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error when converting video for streaming", err)
+		return
+	}
+
+	defer processedFile.Close()
+
+	key := fmt.Sprintf("%v/%v", ratio, getAssetPath(mediaTypeToExt(mediaType)))
 
 	_, err = cfg.s3Client.PutObject(context.Background(),
 		&s3.PutObjectInput{
 			Bucket:      &cfg.s3Bucket,
 			Key:         &key,
-			Body:        tmpFile,
+			Body:        processedFile,
 			ContentType: &mediaType,
 		})
 
